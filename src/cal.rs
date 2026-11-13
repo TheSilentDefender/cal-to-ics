@@ -7,7 +7,7 @@ use serenity::all::{
     UserId,
 };
 use serenity::http::{LightMethod, Request, Route, UserPagination};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 /// max users discord will send over
 const PAGE_SIZE: u64 = 100;
