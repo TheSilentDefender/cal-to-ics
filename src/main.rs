@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use poise::serenity_prelude as serenity;
+use tracing::{debug, info, warn};
 
 use store::Store;
 
@@ -38,6 +39,7 @@ async fn calendar(_: Context<'_>) -> Result<(), Error> {
 /// get link
 #[poise::command(slash_command)]
 async fn link(ctx: Context<'_>) -> Result<(), Error> {
+    debug!("command used");
     let token = ctx.data().store.get_or_create(ctx.author().id.get()).await?;
     send_link(
         ctx,
@@ -95,7 +97,12 @@ async fn subscribe(State(app): State<App>, Path(token): Path<String>) -> Respons
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let _ = dotenvy::dotenv();
-
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
     let public_url = env::var("PUBLIC_URL")
         .expect("PUBLIC_URL must be set")

@@ -105,6 +105,7 @@ async fn fetch_events(
 }
 
 fn parse_event(guild_id: GuildId, v: serde_json::Value) -> Option<(ScheduledEvent, Extras)> {
+    debug!("parsing event");
     let extras = Extras::deserialize(&v).unwrap_or_else(|e| {
         warn!(%guild_id, error = %e, "can't parse recurrence data, treating as one-off");
         Extras::default()
