@@ -15,8 +15,17 @@ const PAGE_SIZE: u64 = 100;
 /// RFC 5545 weekday names, discord uses 0 = monday
 const DAYS: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
 /// discord's recurrence_rule, serenity doesn't parse for some reason?
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+struct Extras {
+    recurrence_rule: Option<RecurrenceRule>,
+    #[serde(rename = "guild_scheduled_event_exceptions")]
+    exceptions: Option<Vec<EventException>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RecurrenceRule {
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,
@@ -31,16 +40,33 @@ struct RecurrenceRule {
     count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct NWeekday {
     n: i8,
     day: u8,
 }
 
+/// occurrence of a recurring event that was canceled
+#[derive(Debug, Deserialize)]
+struct EventException {
+    event_exception_id: String,
+    #[serde(default)]
+    is_canceled: bool,
+    scheduled_start_time: Option<DateTime<Utc>>,
+    scheduled_end_time: Option<DateTime<Utc>>,
+}
+
+impl EventException {
+    fn original_start(&self) -> Option<DateTime<Utc>> {
+        let id: u64 = self.event_exception_id.parse().ok()?;
+        DateTime::from_timestamp_millis(((id >> 22) + DISCORD_EPOCH_MS) as i64)
+    }
+}
+
 /// an event the user is interested in, plus everything needed to render it
 struct Found {
     event: ScheduledEvent,
-    rule: Option<RecurrenceRule>,
+    extras: Extras,
     guild_name: String,
 }
 
@@ -49,65 +75,48 @@ pub async fn collect_events(http: &Http, cache: &Cache, user: UserId) -> Vec<Eve
     let guilds = cache.guilds();
     info!(%user, guilds = guilds.len(), "collecting events");
 
-    // one future per server (why is it called guild)
     let per_guild = guilds.into_iter().map(|guild_id| {
         let guild_name = cache
             .guild(guild_id)
-            .map(|g| g.name.clone())
-            .unwrap_or_else(|| {
-                debug!(%guild_id, "guild not in cache, using id as name");
-                guild_id.to_string()
-            });
+            .map_or_else(|| guild_id.to_string(), |g| g.name.clone());
         interested_in_guild(http, guild_id, guild_name, user)
     });
 
     let mut found: Vec<Found> = join_all(per_guild).await.into_iter().flatten().collect();
+    found.sort_by_key(|f| f.event.start_time);
 
-    let recurring = found.iter().filter(|f| f.rule.is_some()).count();
+    let recurring = found.iter().filter(|f| f.extras.recurrence_rule.is_some()).count();
     info!(%user, total = found.len(), recurring, "collected events");
 
-    found.sort_by_key(|f| f.event.start_time);
-    found.iter().map(to_ical_event).collect() // push directly to ical event
+    found.iter().flat_map(to_ical_events).collect()
 }
 
 /// raw fetch so we can grab recurrence_rule, which serenity's struct drops
 async fn fetch_events(
     http: &Http,
     guild_id: GuildId,
-) -> serenity::Result<Vec<(ScheduledEvent, Option<RecurrenceRule>)>> {
+) -> serenity::Result<Vec<(ScheduledEvent, Extras)>> {
     let req = Request::new(Route::GuildScheduledEvents { guild_id }, LightMethod::Get)
         .params(Some(vec![("with_user_count", "true".to_string())]));
     let raw: Vec<serde_json::Value> = http.fire(req).await?;
     debug!(%guild_id, count = raw.len(), "fetched raw events");
 
-    Ok(raw
-        .into_iter()
-        .filter_map(|v| {
-            let rule = v
-                .get("recurrence_rule")
-                .filter(|r| !r.is_null())
-                .and_then(|r| match serde_json::from_value::<RecurrenceRule>(r.clone()) {
-                    Ok(rule) => Some(rule),
-                    Err(e) => {
-                        // event still shows up, just as a one off
-                        warn!(%guild_id, error = %e, raw = %r, "can't parse recurrence_rule");
-                        None
-                    },
-                });
-            // serenity ignores unknown fields so the same value works here
-            match serde_json::from_value::<ScheduledEvent>(v) {
-                Ok(event) => {
-                    trace!(%guild_id, event = %event.id, name = %event.name,
-                        recurring = rule.is_some(), "parsed event");
-                    Some((event, rule))
-                },
-                Err(e) => {
-                    warn!(%guild_id, error = %e, "can't parse event");
-                    None
-                },
-            }
-        })
-        .collect())
+    Ok(raw.into_iter().filter_map(|v| parse_event(guild_id, v)).collect())
+}
+
+fn parse_event(guild_id: GuildId, v: serde_json::Value) -> Option<(ScheduledEvent, Extras)> {
+    let extras = Extras::deserialize(&v).unwrap_or_else(|e| {
+        warn!(%guild_id, error = %e, "can't parse recurrence data, treating as one-off");
+        Extras::default()
+    });
+    // serenity ignores unknown fields, so the same value works here
+    match ScheduledEvent::deserialize(v) {
+        Ok(event) => Some((event, extras)),
+        Err(e) => {
+            warn!(%guild_id, error = %e, "can't parse event");
+            None
+        },
+    }
 }
 
 /// events in one server the user is interested in
@@ -124,25 +133,18 @@ async fn interested_in_guild(
             return Vec::new();
         },
     };
-
     let total = events.len();
+
     let checks = events
         .into_iter()
         // nobody interested means the user isn't so get drop that fucker
-        .filter(|(event, _)| {
-            let keep = event.user_count != Some(0);
-            if !keep {
-                trace!(%guild_id, event = %event.id, "skipping, nobody interested");
-            }
-            keep
-        })
-        .map(|(event, rule)| async move {
+        .filter(|(event, _)| event.user_count != Some(0))
+        .map(|(event, extras)| async move {
             match is_interested(http, guild_id, event.id, user).await {
-                Ok(true) => Some((event, rule)),
+                Ok(true) => Some((event, extras)),
                 Ok(false) => None,
                 Err(e) => {
-                    warn!(%guild_id, event = %event.id, error = %e,
-                        "can't get interested users");
+                    warn!(%guild_id, event = %event.id, error = %e, "can't get interested users");
                     None
                 },
             }
@@ -152,11 +154,7 @@ async fn interested_in_guild(
         .await
         .into_iter()
         .flatten()
-        .map(|(event, rule)| Found {
-            event,
-            rule,
-            guild_name: guild_name.clone(),
-        })
+        .map(|(event, extras)| Found { event, extras, guild_name: guild_name.clone() })
         .collect();
 
     debug!(%guild_id, guild = %guild_name, total, interested = found.len(), "checked guild");
@@ -170,7 +168,6 @@ async fn is_interested(
     user: UserId,
 ) -> serenity::Result<bool> {
     let mut after = None;
-    let mut pages = 0u32;
     loop {
         let page = guild
             .scheduled_event_users_optioned(
@@ -181,27 +178,16 @@ async fn is_interested(
                 Some(false),
             )
             .await?;
-        pages += 1;
-        trace!(%event, page = pages, users = page.len(), "fetched interested users page");
 
         if page.iter().any(|u| u.user.id == user) {
-            debug!(%event, %user, pages, "user is interested");
             return Ok(true);
         }
         // if a page is < 100 then its the last page
         if (page.len() as u64) < PAGE_SIZE {
-            trace!(%event, %user, pages, "user not interested");
             return Ok(false);
         }
         after = page.last().map(|u| u.user.id);
     }
-}
-
-/// comma join a list, None if missing or empty
-fn join<T: ToString>(v: &Option<Vec<T>>) -> Option<String> {
-    v.as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().map(T::to_string).collect::<Vec<_>>().join(","))
 }
 
 /// discord recurrence_rule -> RFC 5545 RRULE value
@@ -222,117 +208,115 @@ fn to_rrule(r: &RecurrenceRule) -> Option<String> {
     }
 
     // plain weekdays and "nth weekday" both go in BYDAY
-    let mut byday: Vec<String> = r
-        .by_weekday
-        .iter()
-        .flatten()
-        .filter_map(|&d| {
-            let day = DAYS.get(d as usize).map(|s| s.to_string());
-            if day.is_none() {
+    let plain = r.by_weekday.iter().flatten().map(|&d| (None, d));
+    let nth = r.by_n_weekday.iter().flatten().map(|nw| (Some(nw.n), nw.day));
+    let byday: Vec<String> = plain
+        .chain(nth)
+        .filter_map(|(n, d)| {
+            let Some(day) = DAYS.get(d as usize) else {
                 warn!(day = d, "weekday out of range, dropping");
-            }
-            day
+                return None;
+            };
+            Some(n.map_or_else(|| day.to_string(), |n| format!("{n}{day}")))
         })
         .collect();
-    byday.extend(r.by_n_weekday.iter().flatten().filter_map(|nw| {
-        let day = DAYS.get(nw.day as usize).map(|d| format!("{}{d}", nw.n));
-        if day.is_none() {
-            warn!(day = nw.day, n = nw.n, "nth weekday out of range, dropping");
-        }
-        day
-    }));
-    if !byday.is_empty() {
-        parts.push(format!("BYDAY={}", byday.join(",")));
-    }
 
-    for (key, val) in [
+    let lists = [
+        ("BYDAY", (!byday.is_empty()).then(|| byday.join(","))),
         ("BYMONTH", join(&r.by_month)),
         ("BYMONTHDAY", join(&r.by_month_day)),
         ("BYYEARDAY", join(&r.by_year_day)),
-    ] {
-        if let Some(val) = val {
-            parts.push(format!("{key}={val}"));
-        }
-    }
+    ];
+    parts.extend(lists.into_iter().filter_map(|(key, val)| Some(format!("{key}={}", val?))));
 
     // RFC 5545 says COUNT and UNTIL can't both be set
-    if let Some(count) = r.count {
-        if r.end.is_some() {
-            debug!("rule has both count and end, using count");
-        }
-        parts.push(format!("COUNT={count}"));
-    } else if let Some(end) = r.end {
-        parts.push(format!("UNTIL={}", end.format("%Y%m%dT%H%M%SZ")));
+    match (r.count, r.end) {
+        (Some(count), _) => parts.push(format!("COUNT={count}")),
+        (None, Some(end)) => parts.push(format!("UNTIL={}", ical_time(end))),
+        (None, None) => {},
     }
     Some(parts.join(";"))
 }
 
-fn to_ical_event(f: &Found) -> Event {
-    let (event, guild_name) = (&f.event, f.guild_name.as_str());
+fn to_ical_events(f: &Found) -> Vec<Event> {
+    let event = &f.event;
+    let uid = format!("{}@discord-cal", event.id);
     let url = format!("https://discord.com/events/{}/{}", event.guild_id, event.id);
 
-    // external events have free form text, vc events have a channel
     let location = event
         .metadata
         .as_ref()
         .and_then(|m| m.location.clone())
         .or_else(|| {
-            event
-                .channel_id
-                .map(|c| format!("https://discord.com/channels/{}/{c}", event.guild_id))
+            event.channel_id.map(|c| format!("https://discord.com/channels/{}/{c}", event.guild_id))
         })
         .filter(|l| !l.is_empty());
 
     let description = match event.description.as_deref() {
-        Some(d) if !d.is_empty() => format!("{d}\n\nServer: {guild_name}\n{url}"),
-        _ => format!("Server: {guild_name}\n{url}"),
+        Some(d) if !d.is_empty() => format!("{d}\n\nServer: {}\n{url}", f.guild_name),
+        _ => format!("Server: {}\n{url}", f.guild_name),
     };
 
     let next_start = to_utc(event.start_time);
     // vc events have no end time, why? so assume two hours
-    let length = event.end_time.map_or_else(
-        || {
-            trace!(event = %event.id, "no end time, assuming two hours");
-            Duration::hours(2)
-        },
-        |e| to_utc(e) - next_start,
-    );
+    let length = event.end_time.map_or(Duration::hours(2), |e| to_utc(e) - next_start);
     if length <= Duration::zero() {
         warn!(event = %event.id, ?length, "event ends before it starts");
     }
 
-    let start = f.rule.as_ref().map_or(next_start, |r| r.start);
-    let end = start + length;
+    let base = |start: DateTime<Utc>, end: DateTime<Utc>| {
+        let mut ev = Event::new();
+        ev.uid(&uid)
+            .summary(&event.name)
+            .description(&description)
+            .starts(start)
+            .ends(end)
+            .url(&url);
+        if let Some(loc) = &location {
+            ev.location(loc);
+        }
+        ev
+    };
 
-    let mut ev = Event::new();
-    ev.uid(&format!("{}@discord-cal", event.id))
-        .summary(&event.name)
-        .description(&description)
-        .starts(start)
-        .ends(end)
-        .url(&url);
-    let rrule = f.rule.as_ref().and_then(to_rrule);
-    if let Some(rrule) = &rrule {
-        ev.add_property("RRULE", rrule);
+    let rule = f.extras.recurrence_rule.as_ref().and_then(|r| Some((r.start, to_rrule(r)?)));
+    let start = rule.as_ref().map_or(next_start, |(s, _)| *s);
+
+    let mut main = base(start, start + length);
+    if matches!(event.status, ScheduledEventStatus::Canceled) {
+        main.status(EventStatus::Cancelled);
     }
-    if let Some(loc) = &location {
-        ev.location(loc);
+    let Some((_, rrule)) = rule else {
+        return vec![main.done()];
+    };
+    main.add_property("RRULE", &rrule);
+
+    let mut exdates = Vec::new();
+    let mut overrides = Vec::new();
+    let exceptions = f.extras.exceptions.iter().flatten();
+    for (x, original) in exceptions.filter_map(|x| Some((x, x.original_start()?))) {
+        if x.is_canceled {
+            exdates.push(ical_time(original));
+        } else if x.scheduled_start_time.is_some() || x.scheduled_end_time.is_some() {
+            let start = x.scheduled_start_time.unwrap_or(original);
+            let end = x.scheduled_end_time.unwrap_or(start + length);
+            let mut moved = base(start, end);
+            moved.add_property("RECURRENCE-ID", ical_time(original));
+            overrides.push(moved.done());
+        }
     }
-    let canceled = matches!(event.status, ScheduledEventStatus::Canceled);
-    if canceled {
-        ev.status(EventStatus::Cancelled);
+    if !exdates.is_empty() {
+        main.add_property("EXDATE", exdates.join(","));
     }
 
     debug!(
         event = %event.id,
         name = %event.name,
-        guild = %guild_name,
-        %start,
-        rrule = rrule.as_deref().unwrap_or("-"),
-        canceled,
-        "built ical event"
+        %rrule,
+        canceled = exdates.len(),
+        moved = overrides.len(),
+        "built recurring ical event"
     );
-    ev.done()
+    std::iter::once(main.done()).chain(overrides).collect()
 }
 
 /// RFC 5545!!!
@@ -342,7 +326,7 @@ pub fn render_ics(events: &[Event]) -> String {
         .append_property(("METHOD", "PUBLISH"))
         // how often clients *should* refresh, many hate me and ignore this
         .append_property(
-            Property::new("REFRESH-INTERVAL", "PT12H") //12hrs
+            Property::new("REFRESH-INTERVAL", "PT12H")
                 .add_parameter("VALUE", "DURATION")
                 .done(),
         )
@@ -354,6 +338,15 @@ pub fn render_ics(events: &[Event]) -> String {
     let out = cal.to_string();
     info!(events = events.len(), bytes = out.len(), "rendered ics");
     out
+}
+
+fn join<T: ToString>(v: &Option<Vec<T>>) -> Option<String> {
+    let v = v.as_ref().filter(|v| !v.is_empty())?;
+    Some(v.iter().map(T::to_string).collect::<Vec<_>>().join(","))
+}
+
+fn ical_time(t: DateTime<Utc>) -> String {
+    t.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 fn to_utc(ts: Timestamp) -> DateTime<Utc> {
