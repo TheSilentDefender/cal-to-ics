@@ -3,6 +3,7 @@ mod store;
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -10,18 +11,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use poise::serenity_prelude as serenity;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use store::Store;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, App, Error>;
 
+/// how often to re-pull everything from discord
+const REFRESH_EVERY: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone)]
 struct App {
     store: Arc<Store>,
-    http: Arc<serenity::Http>,
-    cache: Arc<serenity::Cache>,
+    events: cal::Snapshot,
     public_url: String,
 }
 
@@ -60,7 +63,7 @@ async fn send_link(ctx: Context<'_>, token: &str, heading: &str) -> Result<(), E
         "{heading}\n\n\
          Or paste this into your calendar app: `{}`\n\n\
          Only events you've marked **Interested** will show up.",
-         app.feed_url(token)
+        app.feed_url(token)
     );
     let button = serenity::CreateButton::new_link(format!("{}/subscribe/{token}", app.public_url))
         .label("Subscribe to Calendar!!!");
@@ -76,7 +79,12 @@ async fn feed(State(app): State<App>, Path(file): Path<String>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let events = cal::collect_events(&app.http, &app.cache, serenity::UserId::new(user_id)).await;
+    // still on the first refresh, an empty calendar would wipe the user's events
+    let Some(events) = cal::collect_events(&app.events, serenity::UserId::new(user_id)).await
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
     (
         [(header::CONTENT_TYPE, "text/calendar; charset=utf-8")],
         cal::render_ics(&events),
@@ -94,15 +102,32 @@ async fn subscribe(State(app): State<App>, Path(token): Path<String>) -> Respons
     (StatusCode::FOUND, [(header::LOCATION, format!("webcal://{rest}"))]).into_response()
 }
 
+/// pulls everything from discord into the snapshot, forever
+async fn refresh_loop(
+    http: Arc<serenity::Http>,
+    cache: Arc<serenity::Cache>,
+    events: cal::Snapshot,
+) {
+    // first tick fires immediately
+    let mut tick = tokio::time::interval(REFRESH_EVERY);
+    loop {
+        tick.tick().await;
+        let fresh = cal::refresh(&http, &cache).await;
+        *events.write().await = Some(Arc::new(fresh));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
     let public_url = env::var("PUBLIC_URL")
         .expect("PUBLIC_URL must be set")
@@ -121,10 +146,12 @@ async fn main() -> Result<(), Error> {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
 
+                let events: cal::Snapshot = Default::default();
+                tokio::spawn(refresh_loop(ctx.http.clone(), ctx.cache.clone(), events.clone()));
+
                 let app = App {
                     store,
-                    http: ctx.http.clone(),
-                    cache: ctx.cache.clone(),
+                    events,
                     public_url,
                 };
 
@@ -135,11 +162,11 @@ async fn main() -> Result<(), Error> {
                 let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
                 tokio::spawn(async move {
                     if let Err(e) = axum::serve(listener, router).await {
-                        eprintln!("HTTP server error: {e}");
+                        error!(error = %e, "HTTP server error");
                     }
                 });
 
-                println!("{} is connected, serving feeds on {bind_addr}", ready.user.name);
+                info!("{} is connected, serving feeds on {bind_addr}", ready.user.name);
                 Ok(app)
             })
         })

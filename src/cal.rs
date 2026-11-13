@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Instant;
+
 use chrono::{DateTime, Duration, Utc};
 use futures::future::join_all;
 use icalendar::{Calendar, Component, Event, EventLike, EventStatus, Property};
@@ -7,6 +11,7 @@ use serenity::all::{
     UserId,
 };
 use serenity::http::{LightMethod, Request, Route, UserPagination};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// max users discord will send over
@@ -16,6 +21,9 @@ const PAGE_SIZE: u64 = 100;
 const DAYS: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 
 const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// every event from every server and will be None until refresh() is done
+pub type Snapshot = Arc<RwLock<Option<Arc<Vec<Found>>>>>;
 
 /// discord's recurrence_rule, serenity doesn't parse for some reason?
 #[derive(Debug, Default, Deserialize)]
@@ -64,31 +72,45 @@ impl EventException {
 }
 
 /// an event the user is interested in, plus everything needed to render it
-struct Found {
+pub struct Found {
     event: ScheduledEvent,
     extras: Extras,
     guild_name: String,
+    interested: HashSet<UserId>,
 }
 
 /// get all upcoming events the user is interested in and sorted by start time
-pub async fn collect_events(http: &Http, cache: &Cache, user: UserId) -> Vec<Event> {
+pub async fn refresh(http: &Http, cache: &Cache) -> Vec<Found> {
+    let started = Instant::now();
     let guilds = cache.guilds();
-    info!(%user, guilds = guilds.len(), "collecting events");
+    info!(guilds = guilds.len(), "refreshing events");
 
     let per_guild = guilds.into_iter().map(|guild_id| {
         let guild_name = cache
             .guild(guild_id)
             .map_or_else(|| guild_id.to_string(), |g| g.name.clone());
-        interested_in_guild(http, guild_id, guild_name, user)
+        guild_events(http, guild_id, guild_name)
     });
 
     let mut found: Vec<Found> = join_all(per_guild).await.into_iter().flatten().collect();
     found.sort_by_key(|f| f.event.start_time);
 
-    let recurring = found.iter().filter(|f| f.extras.recurrence_rule.is_some()).count();
-    info!(%user, total = found.len(), recurring, "collected events");
+    info!(
+        events = found.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "refreshed events"
+    );
+    found
+}
 
-    found.iter().flat_map(to_ical_events).collect()
+pub async fn collect_events(snapshot: &Snapshot, user: UserId) -> Option<Vec<Event>> {
+    let all = snapshot.read().await.clone()?;
+    let mine: Vec<&Found> = all.iter().filter(|f| f.interested.contains(&user)).collect();
+
+    let recurring = mine.iter().filter(|f| f.extras.recurrence_rule.is_some()).count();
+    info!(%user, total = mine.len(), recurring, "collected events");
+
+    Some(mine.into_iter().flat_map(to_ical_events).collect())
 }
 
 /// raw fetch so we can grab recurrence_rule, which serenity's struct drops
@@ -120,13 +142,8 @@ fn parse_event(guild_id: GuildId, v: serde_json::Value) -> Option<(ScheduledEven
     }
 }
 
-/// events in one server the user is interested in
-async fn interested_in_guild(
-    http: &Http,
-    guild_id: GuildId,
-    guild_name: String,
-    user: UserId,
-) -> Vec<Found> {
+/// every event in one server
+async fn guild_events(http: &Http, guild_id: GuildId, guild_name: String) -> Vec<Found> {
     let events = match fetch_events(http, guild_id).await {
         Ok(events) => events,
         Err(e) => {
@@ -136,14 +153,13 @@ async fn interested_in_guild(
     };
     let total = events.len();
 
-    let checks = events
+    let lookups = events
         .into_iter()
         // nobody interested means the user isn't so get drop that fucker
         .filter(|(event, _)| event.user_count != Some(0))
         .map(|(event, extras)| async move {
-            match is_interested(http, guild_id, event.id, user).await {
-                Ok(true) => Some((event, extras)),
-                Ok(false) => None,
+            match interested_users(http, guild_id, event.id).await {
+                Ok(users) => Some((event, extras, users)),
                 Err(e) => {
                     warn!(%guild_id, event = %event.id, error = %e, "can't get interested users");
                     None
@@ -151,23 +167,29 @@ async fn interested_in_guild(
             }
         });
 
-    let found: Vec<Found> = join_all(checks)
+    let found: Vec<Found> = join_all(lookups)
         .await
         .into_iter()
         .flatten()
-        .map(|(event, extras)| Found { event, extras, guild_name: guild_name.clone() })
+        .map(|(event, extras, interested)| Found {
+            event,
+            extras,
+            guild_name: guild_name.clone(),
+            interested,
+        })
         .collect();
 
-    debug!(%guild_id, guild = %guild_name, total, interested = found.len(), "checked guild");
+    debug!(%guild_id, guild = %guild_name, total, kept = found.len(), "refreshed guild");
     found
 }
 
-async fn is_interested(
+/// everyone interested in an event and max 100 at a time
+async fn interested_users(
     http: &Http,
     guild: GuildId,
     event: ScheduledEventId,
-    user: UserId,
-) -> serenity::Result<bool> {
+) -> serenity::Result<HashSet<UserId>> {
+    let mut users = HashSet::new();
     let mut after = None;
     loop {
         let page = guild
@@ -180,14 +202,15 @@ async fn is_interested(
             )
             .await?;
 
-        if page.iter().any(|u| u.user.id == user) {
-            return Ok(true);
-        }
-        // if a page is < 100 then its the last page
-        if (page.len() as u64) < PAGE_SIZE {
-            return Ok(false);
-        }
+        let len = page.len() as u64;
         after = page.last().map(|u| u.user.id);
+        users.extend(page.into_iter().map(|u| u.user.id));
+
+        // if a page is < 100 then its the last page
+        if len < PAGE_SIZE {
+            debug!(%guild, %event, users = users.len(), "fetched interested users");
+            return Ok(users);
+        }
     }
 }
 
